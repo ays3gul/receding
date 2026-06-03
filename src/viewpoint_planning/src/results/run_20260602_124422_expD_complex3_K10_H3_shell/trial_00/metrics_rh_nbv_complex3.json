@@ -1,0 +1,136 @@
+{
+  "method": "RH-NBV",
+  "occlusion": "complex3",
+  "params": {
+    "horizon": 3,
+    "num_candidates": 10,
+    "lambda_cost": 2.0,
+    "discount": 0.85,
+    "step_size": 0.12,
+    "use_spherical_bounds": true,
+    "trial": 0,
+    "seed": 42
+  },
+  "num_iters": 5,
+  "coverages": [
+    0.0,
+    1.28,
+    24.64,
+    28.6,
+    28.6,
+    45.05
+  ],
+  "f1_scores": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "recalls": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "precisions": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "distances": [
+    0.0,
+    0.0447,
+    0.2278,
+    0.3075,
+    0.3075,
+    0.4274
+  ],
+  "times": [
+    0.4,
+    669.6,
+    1438.2,
+    2107.3,
+    2771.3,
+    3443.6
+  ],
+  "ray_tracing_calls": [
+    0,
+    30,
+    60,
+    90,
+    120,
+    150
+  ],
+  "final_coverage": 45.05,
+  "final_f1": 0.0,
+  "final_distance": 0.4274,
+  "total_time": 3443.6,
+  "total_ray_calls": 150,
+  "visibility_efficiency": 45.0,
+  "coverage_auc": 21.13,
+  "hausdorff_distance": 0.101844,
+  "chamfer_distance": 0.039788,
+  "coverage_efficiency": 105.39,
+  "stagnation_count": 1,
+  "first_detection_iter": 1,
+  "views_to_threshold": {
+    "views_to_25pct": 3,
+    "views_to_50pct": null,
+    "views_to_75pct": null
+  },
+  "views_to_f1_threshold": null,
+  "coverage_at_key_iters": {
+    "0": 0.0,
+    "3": 28.6,
+    "6": 45.05,
+    "9": 45.05,
+    "5": 45.05
+  },
+  "sigma_series": [
+    0.0,
+    0.0,
+    0.015909548848867416,
+    0.01625247299671173,
+    0.01625247299671173,
+    0.01907210424542427
+  ],
+  "occluded_recall_series": [
+    0.0,
+    0.0,
+    0.04916891722582621,
+    0.06657014784085531,
+    0.06657014784085531,
+    0.07812456496923463
+  ],
+  "tp_series": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "fp_series": [
+    0,
+    0,
+    190,
+    194,
+    194,
+    165
+  ],
+  "fn_series": [
+    0,
+    0,
+    2332,
+    2332,
+    2332,
+    2332
+  ]
+}

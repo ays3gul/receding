@@ -1,0 +1,136 @@
+{
+  "method": "RH-NBV",
+  "occlusion": "easy",
+  "params": {
+    "horizon": 3,
+    "num_candidates": 10,
+    "lambda_cost": 2.0,
+    "discount": 0.85,
+    "step_size": 0.12,
+    "use_spherical_bounds": true,
+    "trial": 0,
+    "seed": 42
+  },
+  "num_iters": 5,
+  "coverages": [
+    0.0,
+    1.98,
+    25.24,
+    28.77,
+    30.6,
+    50.11
+  ],
+  "f1_scores": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "recalls": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "precisions": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "distances": [
+    0.0,
+    0.0447,
+    0.2278,
+    0.3075,
+    0.3682,
+    0.6255
+  ],
+  "times": [
+    0.3,
+    578.0,
+    1149.8,
+    1734.5,
+    2288.7,
+    2798.3
+  ],
+  "ray_tracing_calls": [
+    0,
+    30,
+    60,
+    90,
+    120,
+    150
+  ],
+  "final_coverage": 50.11,
+  "final_f1": 0.0,
+  "final_distance": 0.6255,
+  "total_time": 2798.3,
+  "total_ray_calls": 150,
+  "visibility_efficiency": 50.1,
+  "coverage_auc": 22.33,
+  "hausdorff_distance": 0.109597,
+  "chamfer_distance": 0.035732,
+  "coverage_efficiency": 80.11,
+  "stagnation_count": 0,
+  "first_detection_iter": 1,
+  "views_to_threshold": {
+    "views_to_25pct": 2,
+    "views_to_50pct": 5,
+    "views_to_75pct": null
+  },
+  "views_to_f1_threshold": null,
+  "coverage_at_key_iters": {
+    "0": 0.0,
+    "3": 28.77,
+    "6": 50.11,
+    "9": 50.11,
+    "5": 50.11
+  },
+  "sigma_series": [
+    0.0,
+    0.0,
+    0.01596166379749775,
+    0.01614745333790779,
+    0.016898034140467644,
+    0.021745823323726654
+  ],
+  "occluded_recall_series": [
+    0.0,
+    0.0,
+    0.06223373151783477,
+    0.08824102692618271,
+    0.10859577311836939,
+    0.13741542059978282
+  ],
+  "tp_series": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "fp_series": [
+    0,
+    0,
+    190,
+    192,
+    207,
+    114
+  ],
+  "fn_series": [
+    0,
+    0,
+    2246,
+    2246,
+    2246,
+    2246
+  ]
+}

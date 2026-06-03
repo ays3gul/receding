@@ -1,0 +1,7 @@
+{
+  "experiment": "D",
+  "planner": "GradientNBV",
+  "num_iters": 5,
+  "occlusion": "easy",
+  "timestamp": "2026-06-02T23:37:29.490204"
+}
