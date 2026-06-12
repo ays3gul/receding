@@ -14,18 +14,24 @@ from scipy.spatial import KDTree
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-
-def _append_obj_history(obj_history_i, score, position_tensor):
-    """Replace oldest entry in obj_history row with new (score, position) pair."""
-    new_entry = np.empty((1, 2), dtype=object)
-    new_entry[0, 0] = float(score)
-    new_entry[0, 1] = position_tensor.detach().cpu().numpy()
-    return np.concatenate([obj_history_i[1:], new_entry], axis=0)
+from viewpoint_planners.planner_eval_mixin import PlannerEvalMixin, init_eval_state
+from viewpoint_planners.fair_comparison_config import (
+    GRID_SIZE as FC_GRID_SIZE,
+    VOXEL_SIZE as FC_VOXEL_SIZE,
+)
 
 
-class PsoPlanner:
+
+
+
+class PsoPlanner(PlannerEvalMixin):
     """
-    Class to plan viewpoints using particle swarm optimization
+    Class to plan viewpoints using particle swarm optimization.
+
+    Strategy (PSO swarm: c1/c2/w/bc, bouncing bounds, pbest/gbest) is UNCHANGED.
+    Only the environment (grid_size, voxel_size) and the evaluation code
+    (calculate_F1 / sigma / occluded recall via PlannerEvalMixin) are aligned
+    with RH-NBV for a fair comparison.
     """
 
     def __init__(
@@ -33,8 +39,8 @@ class PsoPlanner:
         start_pose: np.array,
         mesh_coordinates: np.array,
         mesh_tree,
-        grid_size: np.array = np.array([0.3, 0.3, 0.3]),
-        voxel_size: np.array = np.array([0.002]),
+        grid_size: np.array = FC_GRID_SIZE,
+        voxel_size: np.array = FC_VOXEL_SIZE,
         grid_center: np.array = np.array([0.5, -0.4, 1.1]),
         image_size: np.array = np.array([600, 450]),
         intrinsics: np.array = np.array(
@@ -147,20 +153,19 @@ class PsoPlanner:
         self.pbest = self.X
         self.pbest_obj = np.zeros(self.n_particles)
 
-        self.recall = 3  # for the idea of having pbest depend on only last n iterations
-        self.obj_history = np.empty((n_particles, self.recall, 2), dtype=object)
-        for i in range(n_particles):
-            for j in range(self.recall):
-                self.obj_history[i, j, 0] = np.inf
-                self.obj_history[i, j, 1] = np.zeros(3)
+        self.recall= 3 #for the idea of having pbest depend on only last n iterations
+        self.obj_history = np.array([[[np.inf, []] for _ in range(self.recall)] for _ in range(n_particles)],dtype=object)
 
+ 
         i = 0
         for x in self.X:
             self.pbest_obj[i] = self.voxel_grid.compute_gain(x, self.target_params)[0]
-            i += 1
+            i+=1
 
-        for i in range(self.n_particles):
-            self.obj_history[i] = _append_obj_history(self.obj_history[i], self.pbest_obj[i], self.X[i])
+
+        for i in range(len(self.obj_history)):
+            self._push_obj_history(i, self.pbest_obj[i], self.X[i].detach().cpu().numpy())
+
 
         self.pbest = torch.tensor(
             np.array([min(particle, key=lambda x: x[0])[1] for particle in self.obj_history]),
@@ -175,7 +180,9 @@ class PsoPlanner:
 
         self.particle_trajectories = [self.X.detach().cpu().numpy()] #only for visualizing the particle trajectories
 
-        self.target_voxels = np.array(0)
+        # Evaluation state (target_voxels / all_target_voxels / occluded /
+        # last_tp/fp/fn) shared with RH-NBV via the eval mixin.
+        init_eval_state(self)
 
     def optimization_params(
         self, start_pose: np.array, target_params: np.array
@@ -259,7 +266,7 @@ class PsoPlanner:
                 if self.X[i][j] <= self.camera_bounds[0][j]: #exceeded lower bound
                     bouncing_force = self.camera_bounds[0][j] - self.X[i][j]
                     self.X[i][j] = self.camera_bounds[0][j] #ensure that particles do not exceed the camera bounds
-                    self.V[i][j] = bouncing_force * self.bc #adapt the velocity to have the particle bounce back when it hits the bound, to encourage exploration
+                    self.V[i][j] = bouncing_force * self.bc#adapt the velocity to have the particle bounce back when it hits the bound, to encourage exploration
       
        
         #for printing particle trajectories
@@ -270,11 +277,11 @@ class PsoPlanner:
         i = 0
         for x in self.X:
             obj[i] = self.voxel_grid.compute_gain(x, self.target_params)[0]
-            i += 1
+            i+=1
 
-        # Update the record of previous positions and their utilities
-        for i in range(self.n_particles):
-            self.obj_history[i] = _append_obj_history(self.obj_history[i], obj[i], self.X[i])
+        #Update the record of previous positions and their utilities by removing the oldest and appending the current one
+        for i in range(len(self.obj_history)):
+            self._push_obj_history(i, obj[i], self.X[i].detach().cpu().numpy())
 
         #update local and global best positions and utilities
         self.pbest = torch.tensor(
@@ -287,9 +294,25 @@ class PsoPlanner:
         self.gbest = self.pbest[self.pbest_obj.argmin()]
         self.gbest_obj = self.pbest_obj.min()
 
+
         return obj
 
     
+    def _push_obj_history(self, i, utility, position):
+        """Roll the per-particle (utility, position) history window by one:
+        drop the oldest entry, append the newest. Same behaviour as the original
+        np.append(np.delete(...)).reshape(recall, 2) one-liner, but written so it
+        works on NumPy >= 1.24, which no longer allows building a ragged array
+        (scalar + 3-vector per row) via np.append/ravel. PSO logic is unchanged:
+        obj_history[i] stays a (recall, 2) object array of [utility, xyz]."""
+        hist = self.obj_history[i]
+        # shift older rows up by one, then write the new row at the end
+        for k in range(self.recall - 1):
+            hist[k][0] = hist[k + 1][0]
+            hist[k][1] = hist[k + 1][1]
+        hist[self.recall - 1][0] = utility
+        hist[self.recall - 1][1] = position
+
     def pso_view(self) -> np.array:
         "determine which viewpoint (out of the simulated particles) to move the robot to for updating the grid"
         
@@ -310,15 +333,6 @@ class PsoPlanner:
         return viewpoint, vp_utility
         
 
-    def get_occupied_points(self):
-        voxel_points, sem_conf_scores, sem_class_ids = (
-            self.voxel_grid.get_occupied_points()
-        )
-        voxel_points = voxel_points.cpu().numpy()
-        sem_conf_scores = sem_conf_scores.cpu().numpy()
-        sem_class_ids = sem_class_ids.cpu().numpy()
-        return voxel_points, sem_conf_scores, sem_class_ids
-
     def visualize(self):
         """
         Visualize the voxel grid, the target and the camera bounds in rviz
@@ -334,64 +348,3 @@ class PsoPlanner:
         # Visualize camera bounds
         camera_bounds = self.camera_bounds.cpu().numpy()[:, :3]
         self.rviz_visualizer.visualize_camera_bounds(camera_bounds)
-
-   
-    def calculate_F1(self):
-
-        # Retrieve the data
-        voxel_points, sem_conf_scores, sem_class_ids = self.get_occupied_points()
-
-        # Filter voxel points by class (target class: sem_class_ids == 0)
-        target_voxels = np.array([voxel for i, voxel in enumerate(voxel_points) if sem_class_ids[i] == 0])
-
-        self.target_voxels = target_voxels
-
-        if len(target_voxels) == 0:
-            return 0,0,0  # If no target voxels, return F1 score of 0
-        
-        # Build a k-d tree from mesh coordinates and target voxels
-        mesh_tree = KDTree(self.mesh_coordinates)
-        voxel_tree = KDTree(target_voxels)  
-
-        cube_half_size = 0.002  # the size of a voxel
-        search_radius = np.sqrt(3 * (cube_half_size ** 2)) 
-        nr_correct_voxels = 0
-
-        for voxel in target_voxels:
-            # Query the tree for nearby mesh coordinates
-            candidate_indices = mesh_tree.query_ball_point(voxel, r=search_radius)
-            for idx in candidate_indices:
-                coord = self.mesh_coordinates[idx]
-                if (
-                    abs(voxel[0] - coord[0]) <= cube_half_size and
-                    abs(voxel[1] - coord[1]) <= cube_half_size and
-                    abs(voxel[2] - coord[2]) <= cube_half_size
-                ):
-                    nr_correct_voxels += 1
-                    break  # Stop after the first valid match
-        
-        nr_recalled_mesh_coords = 0
-
-        for coord in self.mesh_coordinates:
-            # Query the tree for nearby voxel points
-            candidate_indices = voxel_tree.query_ball_point(coord, r=search_radius)
-            for idx in candidate_indices:
-                voxel = target_voxels[idx]
-                if (
-                    abs(voxel[0] - coord[0]) <= cube_half_size and
-                    abs(voxel[1] - coord[1]) <= cube_half_size and
-                    abs(voxel[2] - coord[2]) <= cube_half_size
-                ):
-                    nr_recalled_mesh_coords += 1
-                    break  # Stop after the first valid match
-
-        # Calculate precision, recall, and F1 score
-        precision = nr_correct_voxels / len(target_voxels)
-        recall = nr_recalled_mesh_coords / len(self.mesh_coordinates)
-        F1_score = (
-            2 * precision * recall / (precision + recall)
-            if precision + recall > 0
-            else 0
-        )
-
-        return F1_score, recall, precision

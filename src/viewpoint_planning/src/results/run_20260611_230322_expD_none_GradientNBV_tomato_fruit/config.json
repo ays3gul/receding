@@ -1,0 +1,21 @@
+{
+  "experiment": "D",
+  "planner": "GradientNBV_tomato",
+  "target": "tomato06",
+  "num_iters": 5,
+  "num_trials": 1,
+  "base_seed": 42,
+  "grid_size": [
+    0.25,
+    0.25,
+    0.25
+  ],
+  "target_position": [
+    0.5,
+    -0.4,
+    1.06
+  ],
+  "dae_path": "/home/ayse/Desktop/RecedingHorizon/src/simulation_environment/meshes/tomato6.dae",
+  "occlusion": "none",
+  "timestamp": "2026-06-11T23:03:22.810404"
+}

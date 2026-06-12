@@ -40,13 +40,6 @@ import matplotlib.pyplot as plt
 import rospy
 
 from viewpoint_planners.viewpoint_planning import ViewpointPlanning
-import viewpoint_planners.viewpoint_planning as _vp_mod
-import scene_representation.voxel_grid as _vg_mod
-print("=== YUKLENEN DOSYALAR ===")
-print("viewpoint_planning ->", _vp_mod.__file__)
-print("voxel_grid ->", _vg_mod.__file__)
-print("=========================")
-
 from metrics import compute_all_metrics, detect_occlusion_type, save_and_print
 from plots.plot_coverage import plot_coverage_progression
 from plots.plot_trajectory_3d import plot_3d_trajectory
@@ -54,7 +47,17 @@ from plots.plot_candidate_sequences import (
     plot_candidate_sequences,
     plot_candidate_sequences_grid,
 )
-from plots.plot_reconstruction import plot_reconstruction_comparison
+from plots.plot_reconstruction import (
+    plot_reconstruction_comparison,
+    plot_reconstruction_evolution_grid,
+    plot_reconstruction_single_iter,
+)
+
+# Shared single-source-of-truth seed, so RH and GradientNBV anchor their
+# per-trial jitter on the SAME BASE_SEED (paired comparison). grid_size, ROI,
+# and reach come through ViewpointPlanning, which already reads the shared
+# config; only the seed is referenced directly here.
+from viewpoint_planners.fair_comparison_config import BASE_SEED as FC_BASE_SEED
 
 
 # ----------------------------------------------------------------------
@@ -63,20 +66,22 @@ from plots.plot_reconstruction import plot_reconstruction_comparison
 #   EXPERIMENT=C -> Table I  (occlusion-handling),  default 20 viewpoints.
 # Overridable via env vars.
 # ----------------------------------------------------------------------
-EXPERIMENT = os.environ.get("EXPERIMENT", "C").upper()
+EXPERIMENT = os.environ.get("EXPERIMENT", "D").upper()
 _default_iters = 20 if EXPERIMENT == "C" else 5      # Burusa: C=20, D=5
 NUM_ITERS  = int(os.environ.get("NUM_ITERS", _default_iters))
 NUM_TRIALS = int(os.environ.get("NUM_TRIALS", 1))    # trials to average over
-BASE_SEED  = int(os.environ.get("BASE_SEED", 42))    # reproducibility anchor
+BASE_SEED  = FC_BASE_SEED                             # shared with GradientNBV
 
 RH_PARAMS = {
     "horizon":        int(os.environ.get("RH_H", 3)),          # H
     "num_candidates": int(os.environ.get("RH_K", 10)),         # K
     "lambda_cost":    float(os.environ.get("RH_LAMBDA", 2.0)), # lambda
     "discount":       float(os.environ.get("RH_GAMMA", 0.85)), # gamma
-    "step_size":      float(os.environ.get("RH_STEP", 0.12)),
+    "step_size":      float(os.environ.get("RH_STEP", 0.065)),
     # SHELL=0 disables the spherical shell (Burusa-style box-only constraint).
-    "use_spherical_bounds": os.environ.get("SHELL", "1") != "0",
+    "use_spherical_bounds": os.environ.get("RH_SHELL", "0") != "0",
+    # OCC_BONUS>0 re-enables the occlusion-aware IG bonus (ablation). Default 0.
+    "occlusion_bonus": float(os.environ.get("OCC_BONUS", 0.0)),
 }
 K = RH_PARAMS["num_candidates"]
 H = RH_PARAMS["horizon"]
@@ -92,7 +97,7 @@ def make_run_dir(occ):
     return run_dir
 
 
-def save_plots(vp, occ, out_dir):
+def save_plots(vp, occ, out_dir, recon_snapshots=None):
     """Save all figures for a single trial into out_dir. Never raises."""
     rh = vp.rh_planner
 
@@ -137,11 +142,36 @@ def save_plots(vp, occ, out_dir):
         print("  [plot] skipping candidate plots (no candidate_history)")
 
     _try(lambda: plot_reconstruction_comparison(
-        target_voxels=rh.target_voxels,
+        target_voxels=(rh.all_target_voxels
+                       if getattr(rh, "all_target_voxels", None) is not None
+                       and len(rh.all_target_voxels) > 0
+                       else rh.target_voxels),
         mesh_coordinates=rh.mesh_coordinates,
         save_path=os.path.join(out_dir, f"reconstruction_rh_{occ}.png"),
         method_label="RH-NBV",
     ), "reconstruction")
+
+    # --- Per-iteration reconstruction evolution  ---
+    if recon_snapshots:
+        # One grid figure: how the reconstruction grows across viewpoints.
+        _try(lambda: plot_reconstruction_evolution_grid(
+            voxel_snapshots=recon_snapshots,
+            mesh_coordinates=rh.mesh_coordinates,
+            save_path=os.path.join(out_dir, f"reconstruction_evolution_rh_{occ}.png"),
+            method_label="RH-NBV",
+        ), "reconstruction_evolution")
+
+        # One figure per iteration, in a subfolder to keep the trial dir tidy.
+        iter_dir = os.path.join(out_dir, "reconstruction_per_iter")
+        os.makedirs(iter_dir, exist_ok=True)
+        for i, snap in enumerate(recon_snapshots):
+            _try(lambda snap=snap, i=i: plot_reconstruction_single_iter(
+                target_voxels=snap,
+                mesh_coordinates=rh.mesh_coordinates,
+                iteration=i + 1,
+                save_path=os.path.join(iter_dir, f"reconstruction_rh_{occ}_view{i+1:02d}.png"),
+                method_label="RH-NBV",
+            ), f"reconstruction_view{i+1}")
 
 
 def run_single_trial(trial_idx, occ, run_dir):
@@ -160,12 +190,26 @@ def run_single_trial(trial_idx, occ, run_dir):
     seed_for_start = None if trial_idx == 0 else trial_seed
     vp = ViewpointPlanning(lr=0, trial_seed=seed_for_start, rh_params=RH_PARAMS)
 
+    # Snapshot the cumulative reconstruction after each viewpoint so the
+    # per-iteration evolution can be plotted (supervisor request).
+    recon_snapshots = []
+
     for i in range(NUM_ITERS):
         print(f"--- RH Iteration {i + 1}/{NUM_ITERS} ---")
         # Turn on the F1 distance diagnostic on the final iteration only.
         # F1 diagnostic only matters for Experiment D (Table II reconstruction).
         vp._diagnose_f1 = (EXPERIMENT == "D" and i == NUM_ITERS - 1)
         vp.run_rh()
+        # all_target_voxels holds the full cumulative target reconstruction
+        # (set inside calculate_F1); fall back to target_voxels if unset.
+        rh = vp.rh_planner
+        snap = (rh.all_target_voxels
+                if getattr(rh, "all_target_voxels", None) is not None
+                and len(rh.all_target_voxels) > 0
+                else rh.target_voxels)
+        snap = (snap.copy() if isinstance(snap, np.ndarray) and snap.ndim == 2
+                else np.zeros((0, 3)))
+        recon_snapshots.append(snap)
 
     target_voxels = vp.rh_planner.target_voxels
     mesh_coords   = vp.rh_planner.mesh_coordinates
@@ -194,7 +238,7 @@ def run_single_trial(trial_idx, occ, run_dir):
     # Print Burusa-style table and save JSON inside the trial folder.
     save_and_print(results, prefix=os.path.join(trial_dir, "metrics"),
                    experiment=EXPERIMENT)
-    save_plots(vp, occ, trial_dir)
+    save_plots(vp, occ, trial_dir, recon_snapshots=recon_snapshots)
 
     return results
 

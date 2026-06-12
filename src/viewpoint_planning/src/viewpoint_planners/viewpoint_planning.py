@@ -43,7 +43,7 @@ class ViewpointPlanning:
             "discount": 0.85,        # gamma
             "r_min": 0.15,
             "r_max": 0.45,
-            "occlusion_bonus": 2.0,
+            "occlusion_bonus": 0.0,
             "stagnation_patience": 4,
             "use_spherical_bounds": True,   # False => Burusa-style box-only
         }
@@ -119,11 +119,24 @@ class ViewpointPlanning:
         )
 
     def config(self):
-        #self.spawn_no_occlusion()
-        #self.spawn_easy_occlusion()
-        # self.spawn_hard_occlusion()
-        # self.spawn_extreme_occlusion()
-        self.spawn_complex_occlusion()
+        # Occlusion scenario selected via OCC env var (default: none).
+        # Four scenarios chosen to stress *different* failure modes, so the
+        # RH-vs-myopic gap widens as camera freedom shrinks:
+        #   none    -> baseline, no occluder
+        #   frontal -> single central box; camera can sidestep (gap smallest)
+        #   half_box-> sides+top+back enclosed, front (+Y) open (angle planning)
+        #   tunnel  -> two panels, narrow corridor; one correct manoeuvre (gap largest)
+        occ = os.environ.get("OCC", "none").lower()
+        self._occ_type = occ
+        spawn_fn = {
+            "none":     self.spawn_no_occlusion,
+            "frontal":  self.spawn_frontal_occlusion,
+            "half_box": self.spawn_half_box_occlusion,
+            "tunnel":   self.spawn_tunnel_occlusion,
+            "well":     self.spawn_well_occlusion,
+        }.get(occ, self.spawn_no_occlusion)
+        print(f"[Occlusion] scenario = {occ}")
+        spawn_fn()
 
         self.camera_pose = self.viewpoint_sampler.predefine_start_pose(
             self.target_position
@@ -141,7 +154,11 @@ class ViewpointPlanning:
         if self.arm_control:
             self.arm_control.move_arm_to_pose(numpy_to_pose(self.camera_pose))
 
-        self.grid_size = np.array([0.3, 0.6, 0.3])
+        _gs_env = os.environ.get("GRID_SIZE")
+        if _gs_env:
+            self.grid_size = np.array([float(v) for v in _gs_env.split(",")])
+        else:
+            self.grid_size = np.array([0.3, 0.6, 0.3])
         self.grid_center = self.target_position
 
         camera_info = self.perceiver.get_camera_info()
@@ -155,24 +172,65 @@ class ViewpointPlanning:
         """No occluding object is spawned."""
         pass
 
-    def spawn_easy_occlusion(self):
-        """Single box, offset to the side."""
-        self.sdf_spawner.spawn_box(np.array([0.65, -0.3, 1.1]), 1)
+    def spawn_frontal_occlusion(self):
+        """
+        Single box on the camera->ROI sight line, centred on the ROI front
+        face (~1/2 of the front face hidden). The camera can sidestep around
+        it, so even a myopic planner partly recovers -> this is the scenario
+        where RH's advantage over GradientNBV is SMALLEST (lower bound).
+        """
+        self.sdf_spawner.spawn_sized_box(np.array([0.5, -0.25, 1.1]), 1, "medium")
 
-    def spawn_hard_occlusion(self):
-        """Single box, closer to the target and more centered."""
-        self.sdf_spawner.spawn_box(np.array([0.6, -0.25, 1.1]), 1)
+    def spawn_half_box_occlusion(self):
+        """
+        Partial enclosure: sides (X+/X-) and back (Y-) are walled off, but BOTH
+        the front (+Y, camera side) AND the top (Z+) are left OPEN. This forces
+        the camera to view the ROI either head-on through the frontal gap or by
+        climbing to look down from above — exactly the kind of multi-step
+        manoeuvre RH-NBV can plan and a myopic planner cannot. Removing the top
+        panel keeps the scenario solvable: in the earlier closed-top version the
+        camera's orbital sampling collided with the lid and never recovered the
+        target. Thin panels (0.02 m) sit just outside the ROI so they never
+        intersect the bunny.
+        """
+        self.sdf_spawner.spawn_named_model(np.array([0.40, -0.40, 1.10]), 1, "panel_side")  # left
+        self.sdf_spawner.spawn_named_model(np.array([0.64, -0.40, 1.10]), 2, "panel_side")  # right
+        self.sdf_spawner.spawn_named_model(np.array([0.50, -0.51, 1.10]), 3, "panel_back")  # back
 
-    def spawn_extreme_occlusion(self):
-        """Two stacked boxes aligned in front of the target."""
-        self.sdf_spawner.spawn_box(np.array([0.6, -0.3, 1.1]), 1)
-        self.sdf_spawner.spawn_box(np.array([0.6, -0.3, 1.2]), 2)
+    def spawn_tunnel_occlusion(self):
+        """
+        Two parallel panels in front of the ROI (Y=-0.25) leaving a ~12 cm
+        corridor (X[0.44,0.56]) through which the ROI is visible. The camera
+        must align with the corridor to see the target; a greedy single step
+        easily misses it. Recovering the ROI requires a specific sequence of
+        manoeuvres, so this is the scenario where RH's multi-step planning is
+        most necessary -> RH's advantage over GradientNBV is LARGEST.
 
-    def spawn_complex_occlusion(self):
-        """Three-object occlusion setup."""
-        self.sdf_spawner.spawn_box(np.array([0.73, -0.25, 0.95]), 1)
-        self.sdf_spawner.spawn_bar(np.array([0.5, -0.22, 1.0]), 2)
-        self.sdf_spawner.spawn_box(np.array([0.6, -0.32, 1.3]), 3)
+        Panels are at Y=-0.25 (between camera and ROI) and only 0.10 m deep in
+        Y, so they sit ~3 cm in front of the bunny (bunny front face Y=-0.329)
+        WITHOUT intersecting it. An earlier version placed them at Y=-0.30 with
+        0.18 m depth, which overlapped the bunny and made the physics engine
+        shove the target — fixed here.
+        """
+        self.sdf_spawner.spawn_named_model(np.array([0.43, -0.25, 1.10]), 1, "panel_tunnel")  # left
+        self.sdf_spawner.spawn_named_model(np.array([0.57, -0.25, 1.10]), 2, "panel_tunnel")  # right
+
+    def spawn_well_occlusion(self):
+        """
+        "Well": the ROI is walled on all four sides (left/right/front/back) with
+        ONLY THE TOP open, so the camera must climb above the target and look
+        down to see it. The walls are SHORT (0.16 m tall, centred at Z=1.08, so
+        spanning Z[1.00,1.16]) — lower than the bunny's top (Z=1.177) and well
+        below the camera's reachable height (Z up to ~1.25). An earlier version
+        used 0.22 m walls reaching Z=1.21, which the camera could barely clear,
+        leaving the target essentially unobservable (coverage ~0). Lowering the
+        walls keeps the scenario hard (only a top-down view works) but solvable.
+        All four panels sit just outside the bunny bbox so none intersect it.
+        """
+        self.sdf_spawner.spawn_named_model(np.array([0.40, -0.40, 1.08]), 1, "panel_side_low")   # left  (X-)
+        self.sdf_spawner.spawn_named_model(np.array([0.64, -0.40, 1.08]), 2, "panel_side_low")   # right (X+)
+        self.sdf_spawner.spawn_named_model(np.array([0.52, -0.28, 1.08]), 3, "panel_front_low")  # front (Y+)
+        self.sdf_spawner.spawn_named_model(np.array([0.52, -0.52, 1.08]), 4, "panel_front_low")  # back  (Y-)
 
     # -----------------------------------------------------
     # RH execution
@@ -233,7 +291,19 @@ class ViewpointPlanning:
             self.cumulative_time_rh, self.cumulative_time_rh[-1] + iter_time
         )
 
-        f1, recall, precision = self.rh_planner.calculate_F1(diagnose=self._diagnose_f1)
+        # Only the tunnel panels intrude into the ROI clip cube; mask their
+        # voxels so panel surface isn't counted as reconstruction false
+        # positives. Other scenarios' occluders sit fully outside the ROI.
+        occ_positions = None
+        if getattr(self, "_occ_type", "none") == "tunnel":
+            # (center, half-extent) per panel, matches the panel_tunnel SDF
+            # (0.02 x 0.10 x 0.20) at Y=-0.25, +2mm margin for surface voxels.
+            occ_positions = [
+                (np.array([0.43, -0.25, 1.10]), np.array([0.012, 0.052, 0.102])),
+                (np.array([0.57, -0.25, 1.10]), np.array([0.012, 0.052, 0.102])),
+            ]
+        f1, recall, precision = self.rh_planner.calculate_F1(
+            occluder_positions=occ_positions, diagnose=self._diagnose_f1)
         self.f1_rh = np.append(self.f1_rh, f1)
         self.recall_rh = np.append(self.recall_rh, recall)
         self.precision_rh = np.append(self.precision_rh, precision)
@@ -300,30 +370,64 @@ class ViewpointPlanning:
 
     # ----------Mesh loading-------------
     def get_mesh_coordinates(self):
+        import os as _os
+        target = _os.environ.get("MESH_TARGET", "bunny").lower()
+        if target == "tomato":
+            return self._get_tomato_mesh_coordinates()
+        else:
+            return self._get_bunny_mesh_coordinates()
+
+    def _get_bunny_mesh_coordinates(self):
+        import os as _os
         file_path = "/home/ayse/Desktop/RecedingHorizon/src/simulation_environment/meshes/bunny.dae"
         tree = ET.parse(file_path)
         root = tree.getroot()
-
         namespaces = {"ns": "http://www.collada.org/2005/11/COLLADASchema"}
         positions_array = root.find(
             ".//ns:float_array[@id='bun_zipper-mesh-positions-array']", namespaces
         )
         if positions_array is None:
-            raise ValueError("Positions array not found in the COLLADA file.")
-
+            raise ValueError("Bunny positions array not found in the COLLADA file.")
         raw_data = list(map(float, positions_array.text.split()))
         vertices = np.array(raw_data).reshape(-1, 3)
         vertices_swapped = vertices[:, [0, 2, 1]]
-
         scale = np.array([-1.2, 1.2, 1.2])
-        # Z translation of the ground-truth mesh. This MUST be calibrated so the
-        # mesh coincides with the bunny the depth camera actually reconstructs.
-        # Gazebo spawns the bunny at z=1.0 (bunny.world). The correct vertical
-        # correction is being determined empirically via the F1 DIAG output;
-        # override with env var MESH_Z_CORR (metres subtracted from 1.0).
-        import os as _os
         z_corr = float(_os.environ.get("MESH_Z_CORR", 0.048))
         translation = np.array([0.5, -0.4, 1.0 - z_corr])
         transformed_coords = vertices_swapped * scale + translation
         mesh_tree = KDTree(transformed_coords)
+        return transformed_coords, mesh_tree
+
+    def _get_tomato_mesh_coordinates(self):
+        file_path = "/home/ayse/Desktop/RecedingHorizon/src/simulation_environment/meshes/tomato6.dae"
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        namespaces = {"ns": "http://www.collada.org/2005/11/COLLADASchema"}
+        # Sadece Fruit1-4 — dal ve yapraklar doğal occluder, GT'ye dahil değil
+        FRUIT_NODES = {"Fruit1", "Fruit2", "Fruit3", "Fruit4"}
+        fruit_arr_ids = set()
+        for node in root.findall(".//ns:visual_scene//ns:node", namespaces):
+            name = node.get("name", "")
+            if name in FRUIT_NODES:
+                for inst in node.findall(".//ns:instance_geometry", namespaces):
+                    url = inst.get("url", "").lstrip("#")
+                    fruit_arr_ids.add(url.replace("-mesh", "") + "-mesh-positions-array")
+        arrays = root.findall(".//ns:float_array", namespaces)
+        pos_arrays = [a for a in arrays if (a.get("id") or "") in fruit_arr_ids]
+        if not pos_arrays:
+            raise ValueError("Tomato fruit positions arrays not found in the COLLADA file.")
+        all_verts = []
+        for a in pos_arrays:
+            raw = list(map(float, a.text.split()))
+            verts = np.array(raw).reshape(-1, 3)
+            all_verts.append(verts)
+        coords = np.vstack(all_verts)
+        # Z_UP DAE -> Gazebo: (x, y, z) -> (x, -z, y)
+        coords_gz = np.column_stack([coords[:, 0], -coords[:, 2], coords[:, 1]])
+        # tomato06_bunnypos.world: pose=0.5 -0.4 0.8, scale=0.4
+        scale = np.array([0.4, 0.4, 0.4])
+        translation = np.array([0.5, -0.4, 0.8])
+        transformed_coords = coords_gz * scale + translation
+        mesh_tree = KDTree(transformed_coords)
+        print(f"[tomato fruit mesh] {len(transformed_coords)} verts (Fruit1-4), centroid={transformed_coords.mean(axis=0).round(3)}")
         return transformed_coords, mesh_tree

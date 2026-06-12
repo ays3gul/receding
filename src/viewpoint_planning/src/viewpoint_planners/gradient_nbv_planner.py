@@ -72,6 +72,7 @@ class GradientNBVPlanner(nn.Module):
         self.mesh_coordinates = mesh_coordinates
         self.mesh_tree = mesh_tree
         self.target_voxels = np.array(0)
+        self.all_target_voxels = np.zeros((0, 3))  # full recon for plotting
         self.ray_trace_count = 0
         self.occluded_mesh_points = None
         self.last_tp = 0
@@ -162,14 +163,23 @@ class GradientNBVPlanner(nn.Module):
 
     # ---- Evaluation helpers: identical logic to RHPlanner for fair comparison ----
     def calculate_F1(self, occluder_positions=None, match_threshold=None, diagnose=False):
+        DBG = bool(int(os.environ.get("F1_DEBUG", "0")))
         voxel_points, _, sem_class = self.get_occupied_points()
         self.last_tp = self.last_fp = self.last_fn = 0
+        if DBG: print(f"  [F1DBG] raw occupied voxels = {len(voxel_points)}")
         if len(voxel_points) == 0:
+            if DBG: print("  [F1DBG] EXIT: no occupied voxels at all")
             self.target_voxels = np.zeros((0, 3)); return 0, 0, 0
         sem_class = np.asarray(sem_class)
+        if DBG:
+            uniq, cnt = np.unique(sem_class, return_counts=True)
+            print(f"  [F1DBG] sem_class shapes: sem={sem_class.shape[0]} vox={voxel_points.shape[0]} "
+                  f"| classes={dict(zip(uniq.tolist(), cnt.tolist()))}")
         if sem_class.shape[0] == voxel_points.shape[0]:
             voxel_points = voxel_points[sem_class == 0]
+        if DBG: print(f"  [F1DBG] after sem_class==0 filter = {len(voxel_points)}")
         if len(voxel_points) == 0:
+            if DBG: print("  [F1DBG] EXIT: no voxels with sem_class==0 (target class)")
             self.target_voxels = np.zeros((0, 3)); return 0, 0, 0
         if occluder_positions:
             keep = np.ones(len(voxel_points), dtype=bool)
@@ -178,12 +188,27 @@ class GradientNBVPlanner(nn.Module):
                 keep &= ~in_occ
             voxel_points = voxel_points[keep]
         if len(voxel_points) == 0:
+            if DBG: print("  [F1DBG] EXIT: all voxels removed by occluder masking")
             self.target_voxels = np.zeros((0, 3)); return 0, 0, 0
+        # Full set of reconstructed target-class voxels before the ROI clip,
+        # for the reconstruction plot (parity with RH-NBV).
+        self.all_target_voxels = voxel_points.copy()
         target = self.target_params.detach().cpu().numpy()
         roi_half = float(os.environ.get("ROI_HALF", 0.075))
+        if DBG:
+            vmin = voxel_points.min(axis=0); vmax = voxel_points.max(axis=0)
+            mmin = self.mesh_coordinates.min(axis=0); mmax = self.mesh_coordinates.max(axis=0)
+            mcen = self.mesh_coordinates.mean(axis=0)
+            print(f"  [F1DBG] ROI target  = {np.round(target,4)}  roi_half={roi_half}")
+            print(f"  [F1DBG] voxel bbox  min={np.round(vmin,4)} max={np.round(vmax,4)}")
+            print(f"  [F1DBG] mesh  bbox  min={np.round(mmin,4)} max={np.round(mmax,4)}")
+            print(f"  [F1DBG] mesh centroid = {np.round(mcen,4)}")
         voxel_points = voxel_points[np.all(np.abs(voxel_points - target) <= roi_half, axis=1)]
         roi_mesh = self.mesh_coordinates[np.all(np.abs(self.mesh_coordinates - target) <= roi_half, axis=1)]
+        if DBG: print(f"  [F1DBG] after ROI crop: voxels={len(voxel_points)} roi_mesh={len(roi_mesh)}")
         if len(voxel_points) == 0 or len(roi_mesh) == 0:
+            if DBG: print("  [F1DBG] EXIT: ROI crop emptied voxels or mesh "
+                          "-> ROI center and reconstructed/mesh region don't overlap")
             self.target_voxels = np.zeros((0, 3)); return 0, 0, 0
         self.target_voxels = voxel_points
         mesh_tree = KDTree(roi_mesh); voxel_tree = KDTree(voxel_points)
@@ -217,6 +242,60 @@ class GradientNBVPlanner(nn.Module):
         recall = nr_recalled / len(roi_mesh)
         f1 = 2*precision*recall/(precision+recall) if precision+recall>0 else 0
         return f1, recall, precision
+
+    # ---- Occluded-recall + sigma: identical logic to RHPlanner (Burusa Table
+    # II metrics). These are MEASUREMENT helpers, not planning strategy, so
+    # copying them verbatim keeps GradientNBV's gradient strategy untouched
+    # while making its metric table directly comparable to RH-NBV's. ----
+    def set_occluded_mesh_points(self):
+        voxel_points, _, _ = self.get_occupied_points()
+        half   = 0.002
+        radius = half * np.sqrt(3)
+        if len(voxel_points) == 0:
+            self.occluded_mesh_points = self.mesh_coordinates.copy()
+            return
+        voxel_tree = KDTree(voxel_points)
+        unseen = []
+        for coord in self.mesh_coordinates:
+            idxs    = voxel_tree.query_ball_point(coord, r=radius)
+            covered = any(
+                all(abs(voxel_points[i][d] - coord[d]) <= half for d in range(3))
+                for i in idxs
+            )
+            if not covered:
+                unseen.append(coord)
+        self.occluded_mesh_points = np.array(unseen) if unseen else np.zeros((0, 3))
+        print(f"[GradientNBV] Occluded after view 0: "
+              f"{len(self.occluded_mesh_points)}/{len(self.mesh_coordinates)} "
+              f"({100*len(self.occluded_mesh_points)/len(self.mesh_coordinates):.1f}%)")
+
+    def compute_occluded_recall(self) -> float:
+        if self.occluded_mesh_points is None or len(self.occluded_mesh_points) == 0:
+            return 0.0
+        voxel_points, _, _ = self.get_occupied_points()
+        if len(voxel_points) == 0:
+            return 0.0
+        voxel_tree = KDTree(voxel_points)
+        half       = 0.002
+        radius     = half * np.sqrt(3)
+        recovered  = 0
+        for coord in self.occluded_mesh_points:
+            idxs = voxel_tree.query_ball_point(coord, r=radius)
+            if any(
+                all(abs(voxel_points[i][d] - coord[d]) <= half for d in range(3))
+                for i in idxs
+            ):
+                recovered += 1
+        return recovered / len(self.occluded_mesh_points)
+
+    def compute_sigma(self) -> float:
+        if not isinstance(self.target_voxels, np.ndarray) or self.target_voxels.ndim < 2:
+            return 0.0
+        if len(self.target_voxels) == 0:
+            return 0.0
+        centroid = self.target_voxels.mean(axis=0)
+        dists    = np.linalg.norm(self.target_voxels - centroid, axis=1)
+        return float(dists.mean())
 
     def visualize(self):
         voxel_points, sem_conf_scores, sem_class_ids = self.get_occupied_points()
